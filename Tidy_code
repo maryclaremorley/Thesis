@@ -1,0 +1,319 @@
+heart_failure <- read.csv("~/Downloads/heart_failure_clinical_records_dataset.csv")
+heartfail = subset(heart_failure, select = -c(time))
+heartfail$DEATH_EVENT = as.factor(heartfail$DEATH_EVENT)
+
+# should all variables be factors??
+heartfail$anaemia = as.factor(heartfail$anaemia)
+heartfail$diabetes = as.factor(heartfail$diabetes)
+heartfail$high_blood_pressure = as.factor(heartfail$high_blood_pressure)
+heartfail$sex = as.factor(heartfail$sex)
+heartfail$smoking = as.factor(heartfail$smoking)
+glimpse(heartfail)
+heartfail %>%
+count(DEATH_EVENT) %>%
+mutate(prop = n/sum(n))
+# see that in the data, 32% of the subjects died
+
+set.seed(123)
+install.packages("rsample")
+library(rsample)
+splits <- initial_split(heartfail, strata = DEATH_EVENT)
+heart_other <- training(splits)
+heart_test <- testing(splits)
+heart_test %>%
+count(DEATH_EVENT) %>%
+mutate(prop = n/sum(n))
+heart_other %>%
+count(DEATH_EVENT) %>%
+mutate(prop = n/sum(n))
+install.packages("generics")
+library(generics)
+lr_mod <-
+logistic_reg(mode = "classification") %>%
+set_engine("glm") %>%
+fit(as.factor(DEATH_EVENT) ~ ., data = heart_other)
+predictions_glm <- lr_mod %>%
+predict(new_data = heart_test) %>%
+bind_cols(heart_test %>% dplyr::select(DEATH_EVENT))
+predictions_glm
+
+confmat = table(predictions_glm)
+confmat
+accuracy = mean(predictions_glm$.pred_class == predictions_glm$DEATH_EVENT)
+accuracy
+
+# lasso 
+ls_mod <-
+logistic_reg(penalty = tune(), mixture = 1) %>%
+set_engine("glmnet") #%>%
+#fit(as.factor(DEATH_EVENT) ~ ., data = heart_other)
+library(recipes)
+ls_recipe <-
+recipe(DEATH_EVENT ~ ., data = heart_other) #%>%
+#step_num2factor(DEATH_EVENT, levels = survived, skip = T)
+ls_grid <- tibble(penalty = 10^seq(-4,-.5, length.out = 100))
+set.seed(15)
+heart_boot <- bootstraps(heart_other, strata = DEATH_EVENT)
+heart_cv <- vfold_cv(heart_other, v = 10, repeats = 1, strata = DEATH_EVENT)
+library(workflows)
+ls_workflow <-
+workflow() %>%
+add_model(ls_mod) %>%
+add_recipe(ls_recipe)
+library(tune)
+ls_res <-
+ls_workflow %>%
+tune_grid(heart_cv,
+grid = ls_grid,
+control = control_grid(save_pred = TRUE),#)
+metrics = metric_set(roc_auc))
+
+# gathering auc data on resampling
+ls_plot <-
+ls_res %>%
+collect_metrics() %>%
+ggplot(aes(x = penalty, y = mean)) +
+geom_point() +
+geom_line() +
+ylab("Area under ROC Curve") +
+scale_x_log10(labels = scales::label_number())
+
+ls_plot
+top_models <-
+ls_res %>%
+show_best("roc_auc", n = 15) %>%
+arrange(penalty)
+top_models
+# showing top models based on auc
+ls_res <-
+ls_workflow %>%
+tune_grid(heart_cv,
+grid = ls_grid,
+control = control_grid(save_pred = TRUE))
+#metrics = metric_set(yardstick::accuracy))
+
+# getting accuracy data on resampling
+ls_plot <-
+ls_res %>%
+collect_metrics() %>%
+ggplot(aes(x = penalty, y = mean)) +
+geom_point() +
+geom_line() +
+ylab("Accuracy") +
+scale_x_log10(labels = scales::label_number())
+ls_plot
+top_models <-
+ls_res %>%
+show_best("accuracy", n = 15) %>%
+arrange(penalty)
+top_models
+
+# showing top models based on accuracy
+ls_res %>% collect_metrics()
+ls_res %>%
+collect_metrics() %>%
+ggplot(aes(penalty, mean, color = .metric)) +
+geom_errorbar(aes(
+ymin = mean - std_err,
+ymax = mean + std_err
+),
+alpha = 0.5
+) +
+geom_line(size = 1.5) +
+facet_wrap(~.metric, scales = "free", nrow = 2) +
+scale_x_log10() +
+theme(legend.position = "none")
+lambda <- ls_res %>%
+select_best("accuracy")
+final_lasso <- finalize_workflow(
+ls_workflow,
+lambda
+)
+lasso_fit <- final_lasso %>%
+fit(heart_other)
+tidy(lasso_fit)
+
+library(vip)
+
+final_lasso %>%
+fit(heart_other) %>%
+pull_workflow_fit() %>%
+vi(lambda = lambda$penalty) %>%
+mutate(
+Importance = abs(Importance),
+Variable = fct_reorder(Variable, Importance)
+) %>%
+ggplot(aes(x = Importance, y = Variable, fill = Sign)) +
+geom_col() +
+scale_x_continuous(expand = c(0, 0)) +
+labs(y = NULL)
+predictions_lasso <- lasso_fit %>%
+predict(new_data = heart_test) %>%
+bind_cols(heart_test %>% dplyr::select(DEATH_EVENT))
+predictions_lasso
+confmat = table(predictions_lasso)
+confmat
+accuracy = mean(predictions_lasso$.pred_class == predictions_lasso$DEATH_EVENT)
+accuracy
+
+
+#decision tree part
+dt_mod <-
+decision_tree(
+cost_complexity = tune(),
+tree_depth = tune()
+) %>%
+set_engine("rpart") %>%
+set_mode("classification")
+tree_grid <- grid_regular(cost_complexity(),
+tree_depth(),
+levels = 10)
+dt_wf <- workflow() %>%
+add_model(dt_mod) %>%
+add_recipe(ls_recipe)
+dt_res <-
+dt_wf %>%
+tune_grid(resamples = heart_cv,
+grid = tree_grid)
+dt_res %>%
+collect_metrics()
+dt_res %>%
+collect_metrics() %>%
+mutate(tree_depth = factor(tree_depth)) %>%
+ggplot(aes(cost_complexity, mean, color = tree_depth)) +
+geom_line(size = 1.5, alpha = 0.6) +
+geom_point(size = 2) +
+facet_wrap(~ .metric, scales = "free", nrow = 2) +
+scale_x_log10(labels = scales::label_number()) +
+scale_color_viridis_d(option = "plasma", begin = .9, end = 0)
+dt_res %>%
+show_best("roc_auc")
+dt_res %>%
+show_best("accuracy")
+
+best_tree <- dt_res %>%
+select_best("roc_auc")
+tree_final <-
+dt_wf %>%
+finalize_workflow(best_tree)
+dt_final <-
+tree_final %>%
+fit(data = heart_other)
+library(rpart.plot)
+rpart.plot(dt_final$fit$fit$fit)
+predictions_tree <- dt_final %>%
+predict(new_data = heart_test) %>%
+bind_cols(heart_test %>% dplyr::select(DEATH_EVENT))
+predictions_tree
+confmat = table(predictions_tree)
+confmat
+accuracy = mean(predictions_tree$.pred_class == predictions_tree$DEATH_EVENT)
+accuracy
+
+
+# bagged decision tree
+library(baguette)
+bt_mod <- bag_tree(
+# cost_complexity = tune(),
+# min_n = tune(),
+) %>%
+set_engine("rpart", times=25) %>%
+set_mode("classification")
+bt_wf <- workflow() %>%
+add_model(bt_mod) %>%
+add_recipe(ls_recipe)
+set.seed(199)
+fit_bag <- fit_resamples(
+bt_wf,
+heart_cv,
+#metrics = metric_set(rmse, rsq),
+control = control_resamples(verbose = TRUE,
+
+save_pred = TRUE,
+extract = function(x) extract_model(x)))
+bt_best <- fit_bag %>%
+select_best("accuracy")
+bt_final <- finalize_model(
+bt_mod,
+bt_best
+)
+bt_final <-
+bt_wf %>%
+finalize_workflow(bt_best)
+bt_res <- bt_wf %>%
+fit(data = heart_other)
+predictions_bag <- bt_res %>%
+predict(new_data = heart_test) %>%
+bind_cols(heart_test %>% dplyr::select(DEATH_EVENT))
+predictions_bag
+confmat = table(predictions_bag)
+confmat
+accuracy = mean(predictions_bag$.pred_class == predictions_bag$DEATH_EVENT)
+accuracy
+
+
+# random forest
+library(ranger)
+rf_mod <- rand_forest(
+mtry = tune(),
+trees = tune(),
+min_n = tune()
+) %>%
+set_engine("ranger") %>%
+set_mode("classification")
+rf_wf <- workflow() %>%
+add_model(rf_mod) %>%
+add_recipe(ls_recipe)
+rf_res <- tune_grid(
+rf_wf,
+32
+resamples = heart_cv,
+grid = 20
+)
+rf_res
+rf_res %>%
+collect_metrics() %>%
+filter(.metric == "roc_auc") %>%
+select(mean, min_n, mtry, trees) %>%
+pivot_longer(min_n:trees,
+values_to = "value",
+names_to = "parameter"
+) %>%
+ggplot(aes(value, mean, color = parameter)) +
+geom_point(show.legend = FALSE) +
+facet_wrap(~parameter, scales = "free_x") +
+labs(x = NULL, y = "AUC")
+rf_grid <- grid_regular(
+mtry(range = c(3, 9)),
+trees(range = c(200,2000)),
+min_n(range = c(30, 40)),
+levels = 5
+)
+set.seed = (302)
+rf_res2 <- tune_grid(
+rf_wf,
+resamples = heart_cv,
+grid = rf_grid
+)
+rf_best <- rf_res2 %>%
+select_best("roc_auc")
+rf_final <- finalize_model(
+rf_mod,
+rf_best
+)
+rf_final <-
+rf_wf %>%
+finalize_workflow(rf_best)
+
+rf_final <-
+rf_final %>%
+fit(data = heart_other)
+rf_final
+predictions_rf <- rf_final %>%
+predict(new_data = heart_test) %>%
+bind_cols(heart_test %>% dplyr::select(DEATH_EVENT))
+predictions_rf
+confmat = table(predictions_rf)
+confmat
+accuracy = mean(predictions_rf$.pred_class == predictions_rf$DEATH_EVENT)
+accuracy
